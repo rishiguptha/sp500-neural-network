@@ -1,69 +1,74 @@
-import yfinance as yf
-import pandas as pd
-
-def download_data(ticker="^GSPC", period="20y", filename="data/raw/sp500_20years.csv"):
-    """
-    Downloads historical data for the specified ticker and saves it as CSV.
-    """
-    data = yf.download(ticker, period=period)
-    data.to_csv(filename)
-    print(f"Downloaded and saved S&P500 data to '{filename}'")
-    return data
-
-def load_data_from_csv(filepath="data/raw/sp500_20years.csv"):
-    """
-    Loads CSV data into a DataFrame.
-    Assumes the CSV has a multi-index header and the first column as the Date index.
-    """
-    df = pd.read_csv(filepath, header=[0,1], index_col=0, parse_dates=True)
-    return df
-
 import pandas as pd
 import numpy as np
-import yfinance as yf
 
-import pandas as pd
-import numpy as np
-import yfinance as yf
-import os
-
-def load_and_preprocess_data(raw_filepath="data/raw/sp500_20years.csv", 
-                             processed_filepath="data/processed/sp500_20years_processed.csv"):
+def compute_technical_indicators(df):
     """
-    Loads S&P500 data from CSV (downloading it if necessary), fills missing values,
-    computes log returns, and creates a binary target where a good day is defined as:
-    tomorrow's closing price > today's closing price.
-    
-    The processed DataFrame is saved to the processed_filepath for future use.
+    Compute a set of technical indicators and add them to the dataframe.
+    Assumes df has columns: 'Date', 'Open', 'High', 'Low', 'Close', 'Volume'
     """
-    # Ensure that the directories exist
-    os.makedirs(os.path.dirname(raw_filepath), exist_ok=True)
-    os.makedirs(os.path.dirname(processed_filepath), exist_ok=True)
-    
-    try:
-        df = pd.read_csv(raw_filepath, header=[0, 1], index_col=0, parse_dates=True)
-    except FileNotFoundError:
-        data = yf.download("^GSPC", period="20y")
-        data.to_csv(raw_filepath)
-        df = pd.read_csv(raw_filepath, header=[0, 1], index_col=0, parse_dates=True)
 
-    # Flatten MultiIndex columns if needed
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
+    # --- Simple Moving Averages and Bollinger Bands ---
+    sma_windows = [5, 10, 20, 50, 100, 200]
+    for window in sma_windows:
+        df[f'SMA_{window}'] = df['Close'].rolling(window=window).mean()
+        df[f'STD_{window}'] = df['Close'].rolling(window=window).std()
+        # Bollinger Bands: Upper and Lower bands (using 2 standard deviations)
+        df[f'BB_upper_{window}'] = df[f'SMA_{window}'] + 2 * df[f'STD_{window}']
+        df[f'BB_lower_{window}'] = df[f'SMA_{window}'] - 2 * df[f'STD_{window}']
     
-    # Fill missing values: forward then backward fill (avoid deprecated method)
-    df = df.ffill().bfill()
+    # --- Exponential Moving Averages (for MACD) ---
+    ema_short = 12
+    ema_long = 26
+    df[f'EMA_{ema_short}'] = df['Close'].ewm(span=ema_short, adjust=False).mean()
+    df[f'EMA_{ema_long}'] = df['Close'].ewm(span=ema_long, adjust=False).mean()
+
+    # --- MACD and Signal Line ---
+    df['MACD'] = df[f'EMA_{ema_short}'] - df[f'EMA_{ema_long}']
+    df['MACD_signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+
+    # --- Relative Strength Index (RSI) ---
+    delta = df['Close'].diff()
+    # Gains (only positive changes)
+    gain = delta.where(delta > 0, 0)
+    # Losses (absolute value of negative changes)
+    loss = -delta.where(delta < 0, 0)
+    # Use a rolling window of 14 periods (default) to compute average gain and loss
+    window_length = 14
+    avg_gain = gain.rolling(window=window_length, min_periods=window_length).mean()
+    avg_loss = loss.rolling(window=window_length, min_periods=window_length).mean()
+    # Avoid division by zero
+    rs = avg_gain / (avg_loss.replace(0, np.nan))
+    df['RSI'] = 100 - (100 / (1 + rs))
+
+    # --- Average True Range (ATR) ---
+    high_low = df['High'] - df['Low']
+    high_close_prev = np.abs(df['High'] - df['Close'].shift())
+    low_close_prev = np.abs(df['Low'] - df['Close'].shift())
+    true_range = pd.concat([high_low, high_close_prev, low_close_prev], axis=1).max(axis=1)
+    df['ATR_14'] = true_range.rolling(window=14, min_periods=14).mean()
+
+    # --- Price Returns and Lag Features ---
+    df['Return'] = df['Close'].pct_change()
+    # Create lagged returns (e.g., 1-day and 2-day lag)
+    df['Lag_1'] = df['Return'].shift(1)
+    df['Lag_2'] = df['Return'].shift(2)
     
-    # Calculate log returns: ln(Close_t / Close_{t-1})
-    df['Log_Returns'] = np.log(df['Close'] / df['Close'].shift(1))
-    df = df.dropna()  # drop rows with NaN introduced by shift
-    
-    # Create target: 1 if next day's Close > today's Close, else 0
-    df['Target'] = (df['Close'].shift(-1) > df['Close']).astype(int)
-    df = df.dropna()  # drop the last row as target is undefined
-    
-    # Save processed DataFrame to processed folder for future use
-    df.to_csv(processed_filepath)
-    print(f"Processed data saved to '{processed_filepath}'")
+    # Optionally drop rows with NaN values generated from rolling calculations
+    df = df.dropna().reset_index(drop=True)
     
     return df
+
+def main():
+    # Load your processed data
+    df = pd.read_csv('data/processed/sp500_20years_processed.csv', parse_dates=['Date'])
+    df = df.sort_values('Date').reset_index(drop=True)
+    
+    # Compute additional technical indicators
+    df = compute_technical_indicators(df)
+    
+    # Save the enriched dataset
+    df.to_csv('data/processed/sp500_20years_features.csv', index=False)
+    print("Feature engineering complete. Data saved to 'data/processed/sp500_20years_features.csv'")
+
+if __name__ == "__main__":
+    main()
