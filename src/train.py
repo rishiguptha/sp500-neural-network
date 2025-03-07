@@ -1,185 +1,119 @@
-# # src/train.py
-# import numpy as np
-# import tensorflow as tf
-# from sklearn.svm import SVC
-# from sklearn.metrics import accuracy_score, f1_score
-
-# from data_loader import load_and_preprocess_data
-# from feature_engineering import add_economic_features, add_rolling_indicators, add_technical_indicators
-# from model import create_mlp
-
-# def extract_features(model, X):
-#     feature_model = tf.keras.Model(
-#         inputs=model.inputs,  # fix for the "Expected: ['keras_tensor']" issue
-#         outputs=model.get_layer("feature_layer").output
-#     )
-#     return feature_model.predict(X)
-
-# def main():
-    
-#     df = load_and_preprocess_data("data/raw/sp500_20years.csv")
-    
-#     df = add_economic_features(df)
-#     df = add_rolling_indicators(df, window=14)
-#     df = add_technical_indicators(df)
-
-#     feature_cols = [
-#     'Log_Returns', 
-#     'LogReturns_Mean', 'LogReturns_Std', 'LogReturns_Skew', 'LogReturns_Kurtosis',
-#     'RollingMean_14', 'RollingStd_14',
-#     'SMA_20', 'SMA_50', 'EMA_20', 'RSI_14'
-#     ]
-#     X = df[feature_cols].values
-#     y = df['Target'].values
-    
-#     # 5. Time-based split (70% train, 15% val, 15% test)
-#     n = len(df)
-#     train_end = int(0.7 * n)
-#     val_end = int(0.85 * n)
-    
-#     X_train = X[:train_end]
-#     y_train = y[:train_end]
-#     X_val = X[train_end:val_end]
-#     y_val = y[train_end:val_end]
-#     X_test = X[val_end:]
-#     y_test = y[val_end:]
-    
-#     # 6. Build & compile the MLP
-#     input_shape = (X_train.shape[1],)
-#     mlp = create_mlp(input_shape)
-#     mlp.compile(
-#         optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
-#         loss='binary_crossentropy',
-#         metrics=['accuracy']
-#     )
-    
-#     # 7. EarlyStopping callback to prevent overfitting
-#     early_stopping = tf.keras.callbacks.EarlyStopping(
-#         monitor='val_loss',
-#         patience=5,           # stops if val_loss doesn't improve for 5 epochs
-#         restore_best_weights=True
-#     )
-    
-#     # 8. Train the MLP
-#     mlp.fit(
-#         X_train, y_train,
-#         epochs=50,                 # max epochs
-#         batch_size=32,
-#         validation_data=(X_val, y_val),
-#         callbacks=[early_stopping] # includes early stopping
-#     )
-    
-#     # 9. Extract features from MLP for train & test
-#     train_features = extract_features(mlp, X_train)
-#     test_features = extract_features(mlp, X_test)
-    
-#     # 10. Train SVM on extracted features
-#     svm = SVC(kernel='rbf', C=1.0, gamma='scale')
-#     svm.fit(train_features, y_train)
-    
-#     # 11. Evaluate SVM on test set
-#     y_pred = svm.predict(test_features)
-#     accuracy = accuracy_score(y_test, y_pred)
-#     f1 = f1_score(y_test, y_pred)
-    
-#     print(f"SVM Classifier Accuracy: {accuracy:.4f}")
-#     print(f"SVM Classifier F1 Score: {f1:.4f}")
-
-# if __name__ == "__main__":
-#     main()
-
-
-
 import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.utils import class_weight
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, LearningRateScheduler
 import tensorflow as tf
-from sklearn.metrics import accuracy_score, f1_score
-from sklearn.preprocessing import StandardScaler
+import math
+from model import build_lstm_model
 
-from data_loader import load_and_preprocess_data
-from feature_engineering import add_economic_features, add_rolling_indicators, add_technical_indicators
-from model import create_lstm_model
+def load_data(file_path='data/processed/sp500_20years_processed.csv'):
+    """
+    Load the processed CSV file and return features and target.
+    Adjust this function based on your CSV structure.
+    """
+    df = pd.read_csv(file_path, parse_dates=['Date'])
+    df.sort_values('Date', inplace=True)  # ensure data is in time order
 
-def create_sequences(X, y, time_steps=10):
+    # Assume 'Target' is the label and all other numeric columns (except Date) are features.
+    X = df.drop(['Date', 'Target'], axis=1).values
+    y = df['Target'].values
+    return X, y
+
+def create_sequences(features, target, timesteps=10):
     """
-    Converts an array of features and labels into overlapping sequences.
-    :param X: Array of shape (samples, features)
-    :param y: Array of target values (samples,)
-    :param time_steps: Sequence length (number of days).
-    :return: Tuple (X_seq, y_seq) where X_seq has shape (samples, time_steps, features)
-             and y_seq has shape (samples,).
+    Convert the flat feature array into sequences for LSTM.
+    Each sequence will have shape (timesteps, num_features).
     """
-    Xs, ys = [], []
-    for i in range(len(X) - time_steps):
-        Xs.append(X[i:i + time_steps])
-        ys.append(y[i + time_steps])
-    return np.array(Xs), np.array(ys)
+    X_seq, y_seq = [], []
+    for i in range(len(features) - timesteps):
+        X_seq.append(features[i:i+timesteps])
+        y_seq.append(target[i+timesteps])
+    return np.array(X_seq), np.array(y_seq)
+
+def standardize_features(features):
+    """
+    Standardize features using z-score normalization (mean=0, std=1).
+    """
+    # Calculate mean and standard deviation for each feature
+    mean = np.mean(features, axis=0)
+    std = np.std(features, axis=0)
+    
+    # Handle any features with zero standard deviation to avoid division by zero
+    std[std == 0] = 1
+    
+    # Standardize the features: (X - mean) / std
+    standardized_features = (features - mean) / std
+    
+    return standardized_features
 
 def main():
-    # 1. Load and preprocess data; processed data is saved in 'data/processed/'
-    df = load_and_preprocess_data(
-        raw_filepath="data/raw/sp500_20years.csv",
-        processed_filepath="data/processed/sp500_20years_processed.csv"
+    # Load data
+    X, y = load_data()
+
+    # Standardize the features (z-score normalization)
+    X_scaled = standardize_features(X)
+
+    # Set the number of timesteps (look-back period)
+    timesteps = 10
+    X_seq, y_seq = create_sequences(X_scaled, y, timesteps)
+
+    # Split data into train and test sets (here we use a time-based split so we don't shuffle)
+    split_index = int(0.8 * len(X_seq))
+    X_train, X_test = X_seq[:split_index], X_seq[split_index:]
+    y_train, y_test = y_seq[:split_index], y_seq[split_index:]
+
+    # Build the LSTM model:
+    # Here the input shape is (timesteps, num_features)
+    num_features = X_seq.shape[2]
+    model = build_lstm_model(input_shape=(timesteps, num_features),
+                             lstm_units=64,       # use 64 units as in original model
+                             dropout_rate=0.25,   # moderate dropout rate
+                             learning_rate=0.001) # standard learning rate
+
+    model.summary()
+
+    # Set up callbacks for training
+    # Early stopping to prevent unnecessary epochs
+    early_stop = EarlyStopping(
+        patience=15,
+        restore_best_weights=True,
+        verbose=1
     )
     
-    # 2. Add economic features and technical indicators
-    df = add_economic_features(df)
-    df = add_rolling_indicators(df, window=14)
-    df = add_technical_indicators(df)
-    
-    # 3. Define feature columns and target variable
-    feature_cols = [
-        'Log_Returns', 
-        'LogReturns_Mean', 'LogReturns_Std', 'LogReturns_Skew', 'LogReturns_Kurtosis',
-        'RollingMean_14', 'RollingStd_14',
-        'SMA_20', 'SMA_50', 'EMA_20', 'RSI_14'
-    ]
-    X = df[feature_cols].values
-    y = df['Target'].values
-
-    # 4. Scale the features
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
-    # 5. Convert daily features into sequences (using a 10-day window)
-    time_steps = 10
-    X_seq, y_seq = create_sequences(X_scaled, y, time_steps=time_steps)
-    
-    # 6. Chronologically split the data: 70% train, 15% validation, 15% test
-    n = len(X_seq)
-    train_end = int(0.7 * n)
-    val_end = int(0.85 * n)
-    X_train, y_train = X_seq[:train_end], y_seq[:train_end]
-    X_val, y_val = X_seq[train_end:val_end], y_seq[train_end:val_end]
-    X_test, y_test = X_seq[val_end:], y_seq[val_end:]
-    
-    # 7. Build and compile the LSTM model with modified architecture
-    input_shape = (time_steps, X_train.shape[2])
-    lstm_model = create_lstm_model(input_shape, lstm_units=64, dropout_rate=0.3)
-    lstm_model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
-        loss='binary_crossentropy',
-        metrics=['accuracy']
-    )
-    
-    # 8. Add EarlyStopping to prevent overfitting
-    early_stopping = tf.keras.callbacks.EarlyStopping(
+    # Reduce learning rate when a metric has stopped improving
+    reduce_lr = ReduceLROnPlateau(
         monitor='val_loss',
+        factor=0.5,
         patience=5,
-        restore_best_weights=True
+        min_lr=0.00001,
+        verbose=1
     )
     
-    # 9. Train the LSTM model
-    lstm_model.fit(
-        X_train, y_train,
-        epochs=50,
-        batch_size=32,
-        validation_data=(X_val, y_val),
-        callbacks=[early_stopping]
+    # Combine all callbacks
+    callbacks = [early_stop, reduce_lr]
+    
+    # Calculate class weights if the dataset is imbalanced
+    class_weights = class_weight.compute_class_weight(
+        class_weight='balanced',
+        classes=np.unique(y_train),
+        y=y_train
     )
-    
-    # 10. Evaluate the model on the test set
-    test_loss, test_accuracy = lstm_model.evaluate(X_test, y_test)
-    print("LSTM Test Accuracy: {:.4f}".format(test_accuracy))
-    
+    class_weights_dict = dict(enumerate(class_weights))
+
+    # Train the model
+    history = model.fit(X_train, y_train,
+                        epochs=100,                  # extend training to 100 epochs maximum
+                        batch_size=32,               # standard batch size
+                        validation_split=0.1,
+                        callbacks=callbacks,         # use the callbacks defined above
+                        class_weight=class_weights_dict,  # handle class imbalance
+                        verbose=1)
+
+    # Evaluate the model on test data
+    test_loss, test_accuracy = model.evaluate(X_test, y_test)
+    print("Test Accuracy:", test_accuracy)
+
 if __name__ == "__main__":
     main()
